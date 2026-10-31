@@ -18,6 +18,29 @@ LIST_FIELDS = {'network_names', 'matched_npis', 'service_code', 'billing_code_mo
 JSON_FIELDS = {'plans', 'source_files', 'problems', 'problem_examples', 'stats'}
 
 
+def _json_column(values: list):
+    """Dictionary-encoded JSON text: each distinct value is serialized and stored once.
+
+    Every row of a file carries that file's plan list (up to 2,000 plans), so a
+    plain string column repeats it per row and exhausts memory on a full month.
+    """
+    import pyarrow as pa
+    by_object, by_text, dictionary, indices = {}, {}, [], []
+    for value in values:
+        if value is None:
+            indices.append(None)
+            continue
+        index = by_object.get(id(value))
+        if index is None:
+            text = json.dumps(value, sort_keys=True, default=str)
+            index = by_text.setdefault(text, len(dictionary))
+            if index == len(dictionary):
+                dictionary.append(text)
+            by_object[id(value)] = index
+        indices.append(index)
+    return pa.DictionaryArray.from_arrays(pa.array(indices, type=pa.int32()), pa.array(dictionary, type=pa.string()))
+
+
 def _arrow_table(rows: list[dict]):
     import pyarrow as pa
     if not rows:
@@ -28,7 +51,7 @@ def _arrow_table(rows: list[dict]):
         if key in LIST_FIELDS:
             columns[key] = pa.array([list(v) if v is not None else None for v in values], type=pa.list_(pa.string()))
         elif key in JSON_FIELDS:
-            columns[key] = pa.array([json.dumps(v, sort_keys=True, default=str) if v is not None else None for v in values], type=pa.string())
+            columns[key] = _json_column(values)
         elif all(v is None or isinstance(v, bool) for v in values):
             columns[key] = pa.array(values, type=pa.bool_())
         elif all(v is None or (isinstance(v, int) and not isinstance(v, bool)) for v in values):
@@ -42,6 +65,32 @@ def _arrow_table(rows: list[dict]):
 def write_parquet(path: Path, rows: list[dict]) -> None:
     import pyarrow.parquet as pq
     pq.write_table(_arrow_table(rows), path, compression='zstd')
+
+
+def read_rows(path: Path) -> list[dict]:
+    """Read a table back; equal JSON values come back as one shared object."""
+    import pyarrow.parquet as pq
+    if not path.exists():
+        return []
+    table = pq.read_table(path, read_dictionary=sorted(JSON_FIELDS & set(pq.read_schema(path).names)))
+    shared = {}
+    for key in JSON_FIELDS & set(table.column_names):
+        values, cache = [], {}
+        for chunk in table.column(key).chunks:
+            if hasattr(chunk, 'dictionary'):
+                decoded = [None if t is None else cache[t] if t in cache else cache.setdefault(t, json.loads(t))
+                           for t in chunk.dictionary.to_pylist()]
+                values += [None if i is None else decoded[i] for i in chunk.indices.to_pylist()]
+            else:  # a plain string column
+                values += [None if t is None else cache[t] if t in cache else cache.setdefault(t, json.loads(t))
+                           for t in chunk.to_pylist()]
+        shared[key] = values
+        table = table.drop_columns([key])
+    rows = table.to_pylist()
+    for key, values in shared.items():
+        for row, value in zip(rows, values):
+            row[key] = value
+    return rows
 
 
 CSV_COLUMNS = [

@@ -97,7 +97,9 @@ def _includes_market(scope: str) -> bool:
 
 def _file_base(target: dict) -> dict:
     return {k: target[k] for k in ('payer_id', 'payer_name', 'name', 'series', 'published', 'size')} | {
-        'url': target['provenance_url'], 'index_url': target['index_url'], 'plan_count': len(target['plans'])}
+        'url': target['provenance_url'], 'index_url': target['index_url'], 'plan_count': len(target['plans']),
+        'plan_count_total': target.get('plan_count_total', len(target['plans'])),
+        'plans_truncated': target.get('plan_count_total', len(target['plans'])) > len(target['plans'])}
 
 
 def freshness(payer: dict, names: list[str], files: list[dict], today: date, discovery_error: str | None) -> dict:
@@ -148,7 +150,7 @@ def command_discover(args) -> int:
         total = sum(t.size or 0 for t in targets)
         print(f"{payer['id']:16} {len(targets):4} file(s){f', {total / 1e9:.2f} GB listed' if total else ''}")
         for target in targets[: args.show]:
-            print(f"    {target.published or '?':10} {target.name[:110]} plans={len(target.plans)}")
+            print(f"    {target.published or '?':10} {target.name[:110]} plans={target.plan_count_total}")
     return 1 if failures else 0
 
 
@@ -172,6 +174,7 @@ def _discover_jobs(payers: list[dict], today: date, *, allow_cloud_only: bool, d
             jobs.append({'payer_id': payer['id'], 'payer_name': payer['name'], 'url': target.url, 'name': target.name,
                          'series': target.series, 'published': target.published, 'size': target.size,
                          'index_url': target.index_url, 'provenance_url': target.provenance_url(), 'plans': target.plans,
+                         'plan_count_total': target.plan_count_total,
                          'scope': payer.get('scope', default_scope)})
     return jobs, discovered, errors
 
@@ -272,16 +275,8 @@ def command_run(args) -> int:
 
 
 def _read_rows(path: Path) -> list[dict]:
-    import pyarrow.parquet as pq
-    from .output import JSON_FIELDS
-    if not path.exists():
-        return []
-    rows = pq.read_table(path).to_pylist()
-    for row in rows:
-        for key in JSON_FIELDS & row.keys():
-            if isinstance(row[key], str):
-                row[key] = json.loads(row[key])
-    return rows
+    from .output import read_rows
+    return read_rows(path)
 
 
 def command_combine(args) -> int:

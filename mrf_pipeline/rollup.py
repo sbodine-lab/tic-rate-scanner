@@ -81,6 +81,7 @@ def current_rates(rows: list[dict], as_of: date) -> tuple[list[dict], list[dict]
         grouped[rate_key(row)].append(row)
     records = []
     subject = config.subject()['name']
+    merged_plans = {}  # records built from the same plan lists share one merged list
     for key, group in grouped.items():
         first = group[0]
         own = first['provider_role'] != 'market'
@@ -88,10 +89,15 @@ def current_rates(rows: list[dict], as_of: date) -> tuple[list[dict], list[dict]
         amount = Decimal(first['negotiated_rate'])
         dollars = kind == 'dollars_per_unit' and not first.get('wildcard_scope')
         per_unit = dollars and first['billing_code'] in FIFTEEN_MINUTE_CODES
-        plans = {}
-        for row in group:
-            for plan in row.get('plans') or []:
-                plans[(plan.get('plan_id_type'), plan.get('plan_id'), plan.get('plan_name'))] = plan
+        lists = {id(row.get('plans') or ()): row.get('plans') or () for row in group}  # rows of one file share its list
+        plan_key = tuple(sorted(lists))
+        if plan_key not in merged_plans:
+            plans = {}
+            for listed in lists.values():
+                for plan in listed:
+                    plans[(plan.get('plan_id_type'), plan.get('plan_id'), plan.get('plan_name'))] = plan
+            merged_plans[plan_key] = sorted(plans.values(), key=lambda p: (str(p.get('plan_name')), str(p.get('plan_id'))))
+        record_plans = merged_plans[plan_key]
         sources = {}
         for row in group:
             sources[row['source_file_url']] = {'url': row['source_file_url'], 'last_updated_on': row.get('file_last_updated_on'),
@@ -115,8 +121,8 @@ def current_rates(rows: list[dict], as_of: date) -> tuple[list[dict], list[dict]
             'expiration_status': expiration_status(first, as_of), 'additional_information': first.get('additional_information'),
             'networks': sorted({n for r in group for n in r.get('network_names') or []}),
             'provider_group_ids': sorted({r['provider_group_id'] for r in group if r.get('provider_group_id')}),
-            'plans': sorted(plans.values(), key=lambda p: (str(p.get('plan_name')), str(p.get('plan_id')))),
-            'plan_count': len(plans),
+            'plans': record_plans,
+            'plan_count': len(record_plans),
             'source_files': sorted(sources.values(), key=lambda s: s['url']),
             'source_file_count': len(sources),
             'latest_file_last_updated_on': max((s['last_updated_on'] or '') for s in sources.values()) or None,

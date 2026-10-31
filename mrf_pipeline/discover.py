@@ -22,6 +22,10 @@ from .fetch import FetchError, _request, head
 
 DATE_IN_NAME = re.compile(r'(20\d\d-\d\d-\d\d)')
 HASH_SUFFIX = re.compile(r'[-_][0-9a-f]{40,64}(?=[_.-])')
+# A leading edition month ("2026-11_140_13B0_...") also changes every month.
+MONTH_PREFIX = re.compile(r'^20\d\d-\d\d(?=[_-])')
+# Plans kept per file; the full distinct count is still recorded.
+MAX_PLANS = 2000
 
 
 class DiscoveryError(RuntimeError):
@@ -40,6 +44,19 @@ class FileTarget:
     description: str | None = None
     plans: list[dict] = field(default_factory=list)
     signed: bool = False
+    plan_keys: set = field(default_factory=set, repr=False)
+
+    def add_plan(self, plan: dict, limit: int = MAX_PLANS) -> None:
+        """Count every distinct plan; keep the first `limit` (plan_count_total says how many were listed)."""
+        key = json.dumps(plan, sort_keys=True)
+        if key not in self.plan_keys:
+            self.plan_keys.add(key)
+            if len(self.plans) < limit:
+                self.plans.append(plan)
+
+    @property
+    def plan_count_total(self) -> int:
+        return len(self.plan_keys)
 
     def provenance_url(self) -> str:
         """Recorded URL. Signed query strings (CloudFront signatures, Azure SAS) are dropped."""
@@ -58,6 +75,7 @@ def file_name(url: str) -> str:
 def series_key(payer_id: str, name: str) -> str:
     base = urllib.parse.unquote(name.rsplit('/', 1)[-1].split('?', 1)[0])
     base = DATE_IN_NAME.sub('', base, count=1).strip('_-')
+    base = MONTH_PREFIX.sub('', base).strip('_-')
     return f'{payer_id}:{HASH_SUFFIX.sub("", base)}'
 
 
@@ -92,7 +110,7 @@ def _plan(entry: dict) -> dict:
     return {k: str(v) for k, v in out.items()}
 
 
-def toc_targets(payer_id: str, toc_url: str, stream, include, exclude, *, url_fix=None, max_plans: int = 2000) -> list[FileTarget]:
+def toc_targets(payer_id: str, toc_url: str, stream, include, exclude, *, url_fix=None, max_plans: int = MAX_PLANS) -> list[FileTarget]:
     """Stream a CMS table of contents; keep matching in-network files and their plans."""
     files: dict[str, FileTarget] = {}
     for structure in ijson.items(stream, 'reporting_structure.item'):
@@ -107,8 +125,7 @@ def toc_targets(payer_id: str, toc_url: str, stream, include, exclude, *, url_fi
                                                        (DATE_IN_NAME.search(name) or [None])[0] if DATE_IN_NAME.search(name) else None,
                                                        toc_url, description=entry.get('description'))
             for plan in plans:
-                if len(target.plans) < max_plans and plan not in target.plans:
-                    target.plans.append(plan)
+                target.add_plan(plan, max_plans)
             files[location] = target
     return list(files.values())
 
@@ -145,8 +162,7 @@ def _healthsparq(payer: dict, today: date) -> list[FileTarget]:
         target = targets.setdefault(entry['filePath'], FileTarget(payer['id'], base + entry['filePath'], name,
                                     series_key(payer['id'], name), entry.get('lastUpdatedOn'), index))
         for plan in (_plan(p) for p in entry.get('reportingPlans') or []):
-            if len(target.plans) < 2000 and plan not in target.plans:
-                target.plans.append(plan)
+            target.add_plan(plan)
     return list(targets.values())
 
 

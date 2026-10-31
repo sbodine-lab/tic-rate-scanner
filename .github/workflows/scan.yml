@@ -25,6 +25,10 @@ on:
         description: As-of date YYYY-MM-DD for expiration and freshness (blank = today)
         required: false
         default: ''
+      combine_run_id:
+        description: Re-run only the merge, from this earlier run's shard artifacts (kept 3 days)
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -39,6 +43,7 @@ env:
 
 jobs:
   plan:
+    if: inputs.combine_run_id == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     outputs:
@@ -134,11 +139,12 @@ jobs:
 
   combine:
     needs: [plan, shard]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.skip != 'true'
+    if: always() && ((needs.plan.result == 'success' && needs.plan.outputs.skip != 'true') || inputs.combine_run_id != '')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: write
+      actions: read
     env:
       MRF_ALERT_WEBHOOK: ${{ secrets.MRF_ALERT_WEBHOOK }}
     steps:
@@ -157,6 +163,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          run-id: ${{ inputs.combine_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Merge shards and decide payer freshness
         id: combine
         run: |
@@ -185,7 +193,7 @@ jobs:
           tar -C "$RUNNER_TEMP/work" -czf - final | age -R scanner.pub -o "scan-${stamp}.tar.gz.age"
           verdict=$([ "$STATUS" = 0 ] && echo complete || echo "incomplete (at least one payer failed its checks)")
           gh release create "$tag" "scan-${stamp}.tar.gz.age" --title "Scan ${stamp}" \
-            --notes "Encrypted scan output from run ${{ github.run_id }}: ${verdict}."
+            --notes "Encrypted scan output from run ${{ github.run_id }} (shards from run ${{ inputs.combine_run_id || github.run_id }}): ${verdict}."
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Record the scan date
         if: always() && steps.release.outcome == 'success'
