@@ -1,0 +1,6 @@
+# Pinned for the MRF pipeline container and its tests (Python 3.12).
+# ijson: maintained streaming JSON parser with a C (yajl2_c) backend; BSD-3-Clause.
+ijson==3.5.1
+# Parquet output and ad-hoc queries over it.
+pyarrow==26.0.0
+duckdb==1.5.6
