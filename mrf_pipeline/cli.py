@@ -15,12 +15,14 @@ month is inspectable.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 import time
 import tomllib
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -197,9 +199,13 @@ def _process_jobs(jobs: list[dict], workers: int, scratch: str | None) -> tuple[
 
 
 def _finish(out: Path, payers: list[dict], discovered: dict, errors: dict, files: list[dict], rows: list[dict],
-            today: date, extra: dict) -> int:
+            today: date, extra: dict, members: dict[str, list[str]] | None = None) -> int:
     from .output import write_run
     current, excluded = current_rates(rows, today)
+    for record in current if members else []:  # files whose rows equal a cited file's rows also publish the rate
+        identical = sorted(u for source in record['source_files'] for u in members.get(source['url'], []) if u != source['url'])
+        record['identical_source_files'] = identical
+        record['identical_source_file_count'] = len(identical)
     verdicts = [freshness(p, discovered.get(p['id'], []), [f for f in files if f['payer_id'] == p['id']], today, errors.get(p['id']))
                 for p in payers]
     manifest = {'as_of': today.isoformat(), 'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -279,6 +285,74 @@ def _read_rows(path: Path) -> list[dict]:
     return read_rows(path)
 
 
+# Where a row sits in its file, not what it says: provenance, positions and the file's
+# own reference numbers. Left out when comparing two files' rows.
+FILE_LOCAL_FIELDS = frozenset({'source_file_url', 'source_index_url', 'file_sha256', 'retrieved_at', 'plans', 'file_series',
+                               'item_ordinal', 'block_ordinal', 'price_ordinal', 'provider_group_id'})
+
+
+def _row_digest(row: dict) -> int:
+    content = {k: v for k, v in row.items() if k not in FILE_LOCAL_FIELDS}
+    return int.from_bytes(hashlib.sha256(json.dumps(content, sort_keys=True, default=str).encode()).digest(), 'big')
+
+
+def _plan_union(lists) -> list[dict]:
+    merged = {}
+    for listed in lists:
+        for plan in listed:
+            merged[(plan.get('plan_id_type'), plan.get('plan_id'), plan.get('plan_name'))] = plan
+    return sorted(merged.values(), key=lambda p: (str(p.get('plan_name')), str(p.get('plan_id'))))
+
+
+def _collapse_identical_files(directories: list[Path], files: list[dict]) -> tuple[list[dict], dict[str, list[str]]]:
+    """Stream shard rows twice; keep one file's rows where several files publish exactly the same rows.
+
+    Some payers post one file per plan with identical rates (Aetna: ~300 files,
+    ~11,000 rows each). Two files are identical when they have the same payer,
+    last_updated_on and the same multiset of rows, file-local fields aside (an
+    order-independent sum of per-row SHA-256 digests plus the row count). The
+    first URL of each group keeps its rows, carrying the union of the group's
+    plans; the others are recorded on files.parquet as identical_to it.
+    Returns (kept rows, representative URL -> every member URL).
+    """
+    from .output import iter_rows
+    cache: dict = {}
+    digest, count, plans, identity = defaultdict(int), defaultdict(int), {}, {}
+    for directory in directories:
+        for row in iter_rows(directory / 'rates.parquet', cache):
+            url = row['source_file_url']
+            digest[url] = (digest[url] + _row_digest(row)) % (1 << 256)
+            count[url] += 1
+            plans[url] = row.get('plans') or []
+            identity[url] = (row['payer_id'], row.get('file_last_updated_on'))
+    groups = defaultdict(list)
+    for url in digest:
+        groups[(*identity[url], digest[url], count[url])].append(url)
+    representative, members, union = {}, {}, {}
+    for urls in groups.values():
+        urls.sort()
+        members[urls[0]] = urls
+        for url in urls:
+            representative[url] = urls[0]
+        if len(urls) > 1:
+            union[urls[0]] = _plan_union(plans[url] for url in urls)
+    for record in files:
+        url = record['url']
+        record['rows_sha256'] = format(digest[url], '064x') if url in digest else None
+        record['identical_to'] = representative[url] if representative.get(url, url) != url else None
+        record['identical_file_count'] = len(members[url]) if url in members else None
+    rows = []
+    for directory in directories:
+        for row in iter_rows(directory / 'rates.parquet', cache):
+            url = row['source_file_url']
+            if representative[url] != url:
+                continue
+            if url in union:
+                row['plans'] = union[url]
+            rows.append(row)
+    return rows, members
+
+
 def command_combine(args) -> int:
     """Merge run directories into one current-rates output.
 
@@ -290,18 +364,18 @@ def command_combine(args) -> int:
     if args.plan:
         plan = json.loads(Path(args.plan).read_text())
         today = date.fromisoformat(plan['as_of'])
-        files, rows = [], []
-        for directory in map(Path, args.runs):
-            files += _read_rows(directory / 'files.parquet')
-            rows += _read_rows(directory / 'rates.parquet')
+        directories = [Path(d) for d in args.runs]
+        files = [f for directory in directories for f in _read_rows(directory / 'files.parquet')]
         planned = {job['provenance_url'] for job in plan['jobs']}
         seen = {f['url'] for f in files}
         for job in plan['jobs']:  # a shard that died must not look like a quiet payer
             if job['provenance_url'] not in seen:
                 files.append({**_file_base(job), 'status': 'failed', 'error': 'shard produced no result for this file'})
         files = [f for f in files if f['url'] in planned]
+        rows, members = _collapse_identical_files(directories, files)
         payers = load_payers(only=plan['payer_ids'])
-        return _finish(Path(args.out), payers, plan['discovered'], plan['errors'], files, rows, today, {'combined_from': args.runs})
+        return _finish(Path(args.out), payers, plan['discovered'], plan['errors'], files, rows, today,
+                       {'combined_from': args.runs}, members=members)
     from .output import write_run
     today = date.fromisoformat(args.as_of) if args.as_of else date.today()
     verdicts, rows_by_payer, files_by_payer = {}, {}, {}

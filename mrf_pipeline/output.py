@@ -15,7 +15,7 @@ from pathlib import Path
 
 LIST_FIELDS = {'network_names', 'matched_npis', 'service_code', 'billing_code_modifier', 'bundled_tracked_codes',
                'networks', 'provider_group_ids'}
-JSON_FIELDS = {'plans', 'source_files', 'problems', 'problem_examples', 'stats'}
+JSON_FIELDS = {'plans', 'source_files', 'problems', 'problem_examples', 'stats', 'identical_source_files'}
 
 
 def _json_column(values: list):
@@ -67,30 +67,41 @@ def write_parquet(path: Path, rows: list[dict]) -> None:
     pq.write_table(_arrow_table(rows), path, compression='zstd')
 
 
-def read_rows(path: Path) -> list[dict]:
-    """Read a table back; equal JSON values come back as one shared object."""
+def _decode_json(array, cache: dict) -> list:
+    """JSON text column (dictionary-encoded or plain) to shared Python objects."""
+    def load(text):
+        if text is None:
+            return None
+        if text not in cache:
+            cache[text] = json.loads(text)
+        return cache[text]
+    if hasattr(array, 'dictionary'):
+        decoded = [load(text) for text in array.dictionary.to_pylist()]
+        return [None if i is None else decoded[i] for i in array.indices.to_pylist()]
+    return [load(text) for text in array.to_pylist()]
+
+
+def iter_rows(path: Path, cache: dict | None = None, batch_size: int = 50_000):
+    """Yield a table's rows in batches; equal JSON values are one shared object (pass `cache` to share across files)."""
+    import pyarrow as pa
     import pyarrow.parquet as pq
     if not path.exists():
-        return []
-    table = pq.read_table(path, read_dictionary=sorted(JSON_FIELDS & set(pq.read_schema(path).names)))
-    shared = {}
-    for key in JSON_FIELDS & set(table.column_names):
-        values, cache = [], {}
-        for chunk in table.column(key).chunks:
-            if hasattr(chunk, 'dictionary'):
-                decoded = [None if t is None else cache[t] if t in cache else cache.setdefault(t, json.loads(t))
-                           for t in chunk.dictionary.to_pylist()]
-                values += [None if i is None else decoded[i] for i in chunk.indices.to_pylist()]
-            else:  # a plain string column
-                values += [None if t is None else cache[t] if t in cache else cache.setdefault(t, json.loads(t))
-                           for t in chunk.to_pylist()]
-        shared[key] = values
-        table = table.drop_columns([key])
-    rows = table.to_pylist()
-    for key, values in shared.items():
-        for row, value in zip(rows, values):
-            row[key] = value
-    return rows
+        return
+    json_columns = sorted(JSON_FIELDS & set(pq.read_schema(path).names))
+    cache = {} if cache is None else cache
+    for batch in pq.ParquetFile(path, read_dictionary=json_columns).iter_batches(batch_size=batch_size):
+        table = pa.Table.from_batches([batch])
+        decoded = {key: _decode_json(table.column(key).combine_chunks(), cache) for key in json_columns}
+        rows = table.drop_columns(json_columns).to_pylist()
+        for key, values in decoded.items():
+            for row, value in zip(rows, values):
+                row[key] = value
+        yield from rows
+
+
+def read_rows(path: Path) -> list[dict]:
+    """Read a table back; equal JSON values come back as one shared object."""
+    return list(iter_rows(path))
 
 
 CSV_COLUMNS = [
@@ -98,6 +109,7 @@ CSV_COLUMNS = [
     'negotiated_rate', 'unit_label', 'hourly_equivalent', 'hourly_label', 'billing_class', 'setting', 'service_code',
     'expiration_date', 'networks', 'plan_count', 'plan_names', 'latest_file_last_updated_on', 'source_file_urls',
     'distinct_amounts_in_context', 'ambiguity_note', 'additional_information', 'entity_name', 'tin_value', 'payer_id',
+    'identical_source_file_count',
 ]
 
 
