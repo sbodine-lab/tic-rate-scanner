@@ -1,0 +1,71 @@
+# Row counts for an earlier scan's shard outputs, for sizing the merge.
+# Logs show anonymous totals only; the per-payer breakdown is encrypted.
+name: Shard stats
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Scan run whose shard artifacts to count (kept 3 days)
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  stats:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install -q -r mrf_pipeline/requirements.txt
+          sudo apt-get install -y -qq age >/dev/null
+      - name: Decrypt configuration
+        env:
+          SCANNER_AGE_KEY: ${{ secrets.SCANNER_AGE_KEY }}
+        run: bash scripts/decrypt-config.sh
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Count rows
+        run: |
+          work="$RUNNER_TEMP/work"; mkdir -p "$work"
+          for f in artifacts/shard-*/shard-*.tar.gz.age; do
+            n=$(basename "$f" .tar.gz.age); mkdir -p "$work/$n"
+            age -d -i "$RUNNER_TEMP/scanner.key" "$f" | tar -xzf - -C "$work/$n" --strip-components=1
+          done
+          python - "$work" <<'PY'
+          import json, sys, collections, pathlib
+          import pyarrow.parquet as pq, pyarrow.compute as pc
+          root = pathlib.Path(sys.argv[1]); detail = collections.defaultdict(lambda: collections.Counter())
+          for shard in sorted(root.glob('shard-*')):
+              path = shard / 'rates.parquet'
+              if not path.exists():
+                  print(shard.name, 'no rates.parquet'); continue
+              meta = pq.read_metadata(path)
+              plans = 0
+              for g in range(meta.num_row_groups):
+                  rg = meta.row_group(g)
+                  for c in range(rg.num_columns):
+                      if rg.column(c).path_in_schema == 'plans':
+                          plans += rg.column(c).total_uncompressed_size
+              t = pq.read_table(path, columns=['payer_id', 'provider_role', 'source_file_url'])
+              print(f'{shard.name}: rows={t.num_rows} files={len(set(t.column("source_file_url").to_pylist()))} '
+                    f'plans_uncompressed_MB={plans/1e6:.0f} all_columns_uncompressed_MB={sum(meta.row_group(g).total_byte_size for g in range(meta.num_row_groups))/1e6:.0f}')
+              for p, r in zip(t.column('payer_id').to_pylist(), t.column('provider_role').to_pylist()):
+                  detail[p][r] += 1
+          totals = sorted((sum(c.values()) for c in detail.values()), reverse=True)
+          print('rows per payer (anonymous, largest first):', totals, 'total:', sum(totals))
+          (root / 'stats.json').write_text(json.dumps({p: dict(c) for p, c in detail.items()}, indent=1))
+          PY
+          age -R scanner.pub -o stats.json.age "$work/stats.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-stats
+          path: stats.json.age
+          retention-days: 3
