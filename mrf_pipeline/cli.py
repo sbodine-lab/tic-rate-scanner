@@ -374,8 +374,16 @@ def command_combine(args) -> int:
         files = [f for f in files if f['url'] in planned]
         rows, members = _collapse_identical_files(directories, files)
         payers = load_payers(only=plan['payer_ids'])
+        # The configured scope wins over the scope a shard ran with, so narrowing a payer
+        # (Aetna: subject rows only) also applies when re-merging an earlier run's shards.
+        subject_only = {p['id'] for p in payers if not _includes_market(p.get('scope', 'subject+market'))}
+        dropped = defaultdict(int)
+        for row in rows:
+            if row['payer_id'] in subject_only and row['provider_role'] == 'market':
+                dropped[row['payer_id']] += 1
+        rows = [r for r in rows if not (r['payer_id'] in subject_only and r['provider_role'] == 'market')]
         return _finish(Path(args.out), payers, plan['discovered'], plan['errors'], files, rows, today,
-                       {'combined_from': args.runs}, members=members)
+                       {'combined_from': args.runs, 'market_rows_dropped_by_scope': dict(dropped)}, members=members)
     from .output import write_run
     today = date.fromisoformat(args.as_of) if args.as_of else date.today()
     verdicts, rows_by_payer, files_by_payer = {}, {}, {}
