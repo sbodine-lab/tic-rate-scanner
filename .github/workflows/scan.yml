@@ -52,6 +52,14 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
       skip: ${{ steps.retry.outputs.skip }}
     steps:
+      - name: Keep a manual run's payer selection out of the log
+        # The payer list is private configuration. Read the selection from the event file (no
+        # expression, so nothing is printed) and mask it before a step's env block would show it.
+        run: |
+          selection=$(jq -r '.inputs.payers // ""' "$GITHUB_EVENT_PATH")
+          for id in "$selection" $(printf '%s' "$selection" | tr ',' ' '); do
+            if [ -n "$id" ]; then echo "::add-mask::$id"; fi
+          done
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
