@@ -27,7 +27,7 @@ jobs:
         env:
           SCANNER_AGE_KEY: ${{ secrets.SCANNER_AGE_KEY }}
         run: bash scripts/decrypt-config.sh
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           run-id: ${{ inputs.run_id }}
@@ -64,7 +64,7 @@ jobs:
           (root / 'stats.json').write_text(json.dumps({p: dict(c) for p, c in detail.items()}, indent=1))
           PY
           age -R scanner.pub -o stats.json.age "$work/stats.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: shard-stats
           path: stats.json.age

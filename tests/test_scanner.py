@@ -115,5 +115,62 @@ class ScannerTests(unittest.TestCase):
         self.assertTrue(all(r['negotiated_rate'] is None for r in rows))
 
 
+class DiscoveryAndVerdictTests(unittest.TestCase):
+    def serve(self, pages: dict) -> str:
+        import http.server
+        import threading
+
+        class Paths(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = pages.get(self.path)
+                self.send_response(200 if body is not None else 404)
+                self.send_header('Content-Length', str(len(body or b'')))
+                self.end_headers()
+                self.wfile.write(body or b'')
+
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Paths)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f'http://127.0.0.1:{server.server_address[1]}'
+
+    def test_listing_index_name_case_and_toc_paths_follow_the_page(self):
+        from mrf_pipeline.discover import discover
+        pages = {}
+        base = self.serve(pages)
+        other_host = base.replace('127.0.0.1', 'localhost')
+        linked = '/Files/InNetwork/2026-11-02_Example-Plans_A-in-network-rates.json'
+        pages['/Files'] = (b'<a href="/Files/InNetwork/2026-11-02_Example-Plans_index.json">index</a>'
+                           + f'<a href="{linked}">A</a>'.encode())
+        pages['/Files/InNetwork/2026-11-02_Example-Plans_index.json'] = json.dumps({'reporting_structure': [{
+            'reporting_plans': [{'plan_name': 'Plan One', 'plan_id_type': 'EIN', 'plan_id': '1'}],
+            'in_network_files': [
+                {'location': f'{base}/files/Example/InNetwork/2026-11-02_Example-Plans_A-in-network-rates.json'},
+                {'location': f'{base}/files/Example/InNetwork/2026-11-02_Example-Plans_B-in-network-rates.json'},
+                {'location': f'{other_host}/x/2026-11-02_Example-Plans_A-in-network-rates.json'}]}]}).encode()
+        payer = {'id': 'example', 'discovery': 'listing', 'page_url': f'{base}/Files',
+                 'index_pattern': r'_example-plans_index\.json$', 'include': ['.']}
+        urls = sorted(t.url for t in discover(payer, today=date(2026, 11, 13)))
+        self.assertEqual(urls, sorted([
+            base + linked,  # the page's link for the same file on the same host
+            f'{base}/files/Example/InNetwork/2026-11-02_Example-Plans_B-in-network-rates.json',  # not linked: as listed
+            f'{other_host}/x/2026-11-02_Example-Plans_A-in-network-rates.json']))  # another host: never swapped
+
+    def test_expected_files_match_any_case_and_log_line_names_no_payer(self):
+        from mrf_pipeline.cli import failure_summary, freshness
+        payer = {'id': 'example', 'name': 'Example Payer', 'category': 'tic', 'expected': ['network-a'], 'max_age_days': 45}
+        files = [{'name': 'NETWORK-A_rates.json', 'status': 'complete', 'last_updated_on': '2026-11-01'}]
+        ok = freshness(payer, ['NETWORK-A_rates.json'], files, date(2026, 11, 13), None)
+        self.assertEqual((ok['status'], ok['problem_kinds']), ('ok', []))
+        stale = freshness({**payer, 'expected': ['network-b']}, ['NETWORK-A_rates.json'],
+                          [{**files[0], 'last_updated_on': '2026-06-01'}], date(2026, 11, 13), None)
+        self.assertEqual(stale['problem_kinds'], ['missing_expected', 'stale'])
+        line = failure_summary([ok, stale])
+        self.assertEqual(line, '1 payer(s) ok, 1 failed (1 expected file missing, 1 stale)')
+        self.assertNotIn('xample', line)
+
+
 if __name__ == '__main__':
     unittest.main()

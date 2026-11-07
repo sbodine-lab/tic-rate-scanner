@@ -12,11 +12,14 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 
 from . import config
 from .codes import FIFTEEN_MINUTE_CODES, PER_SERVICE_LABEL, UNIT_BASIS, UNIT_LABEL, hourly_equivalent
 
 OPEN_ENDED = '9999-12-31'
+# A file dated after its capture may be an early-posted edition only this far ahead (app/core/rates.py).
+EARLY_POSTING_MAX_DAYS = 31
 VALUE_KINDS = {
     'negotiated': 'dollars_per_unit',
     'fee schedule': 'dollars_per_unit',
@@ -56,6 +59,33 @@ def rate_key(row: dict) -> tuple:
     )
 
 
+def _http_day(value: str | None) -> str | None:
+    try:
+        return parsedate_to_datetime(value).date().isoformat() if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def publication_date_conflict(file: dict) -> bool:
+    """A file dated after its own capture is conflicting evidence, not current.
+
+    It is an early-posted edition instead only when the publisher's catalog
+    states the same edition date, the transport copy predates capture and the
+    date is at most EARLY_POSTING_MAX_DAYS ahead. The reader applies the same
+    rule (app/core/rates.py _early_posted_on), so both call such a file's rates
+    publication_date_conflict, never current.
+    """
+    stamp, captured = (file.get('last_updated_on') or '')[:10], (file.get('retrieved_at') or '')[:10]
+    if not stamp or not captured or stamp <= captured:
+        return False
+    posted = _http_day(file.get('http_last_modified'))
+    try:
+        ahead = (date.fromisoformat(stamp) - date.fromisoformat(captured)).days
+    except ValueError:
+        return True
+    return not (file.get('published') == stamp and posted and posted <= captured and ahead <= EARLY_POSTING_MAX_DAYS)
+
+
 def latest_editions(rows: list[dict]) -> list[dict]:
     """Keep only rows from the newest edition of each file series."""
     newest: dict[str, tuple] = {}
@@ -67,18 +97,37 @@ def latest_editions(rows: list[dict]) -> list[dict]:
     return [r for r in rows if (r.get('file_last_updated_on') or '', r.get('retrieved_at') or '') == newest[r['file_series']]]
 
 
-def current_rates(rows: list[dict], as_of: date) -> tuple[list[dict], list[dict]]:
-    """Return (current rate records, excluded rows with reasons)."""
+def current_rates(rows: list[dict], as_of: date, held_files: frozenset | set = frozenset()) -> tuple[list[dict], list[dict]]:
+    """Return (current rate records, excluded rows with reasons).
+
+    Rows of `held_files` (see publication_date_conflict) are excluded as
+    publication_date_conflict; held_rates() keeps them as labeled records.
+    """
     excluded, grouped = [], defaultdict(list)
     for row in latest_editions(rows):
         status = expiration_status(row, as_of)
         reason = ('expired' if status == 'expired' else 'expiration_unparsed' if status == 'unparsed'
                   else 'identity_conflict' if row.get('identity_conflict')
-                  else 'invalid_rate' if row.get('negotiated_rate') is None else None)
+                  else 'invalid_rate' if row.get('negotiated_rate') is None
+                  else 'publication_date_conflict' if row['source_file_url'] in held_files else None)
         if reason:
             excluded.append({**row, 'exclusion_reason': reason})
             continue
         grouped[rate_key(row)].append(row)
+    return _records(grouped, as_of), excluded
+
+
+def held_rates(excluded: list[dict], as_of: date) -> list[dict]:
+    """Records for rates whose files carry a publication date conflict: dated evidence, never current."""
+    grouped = defaultdict(list)
+    for row in excluded:
+        if row['exclusion_reason'] == 'publication_date_conflict':
+            clean = {key: value for key, value in row.items() if key != 'exclusion_reason'}
+            grouped[rate_key(clean)].append(clean)
+    return _records(grouped, as_of)
+
+
+def _records(grouped: dict, as_of: date) -> list[dict]:
     records = []
     subject = config.subject()['name']
     merged_plans = {}  # records built from the same plan lists share one merged list
@@ -130,7 +179,7 @@ def current_rates(rows: list[dict], as_of: date) -> tuple[list[dict], list[dict]
         })
     _flag_unresolved_ladders(records)
     records.sort(key=lambda r: (r['payer_id'], r['provider_role'], r['entity_id'], r['billing_code'], r['billing_code_modifier'], r['value_kind'], Decimal(r['negotiated_rate'])))
-    return records, excluded
+    return records
 
 
 def _flag_unresolved_ladders(records: list[dict]) -> None:

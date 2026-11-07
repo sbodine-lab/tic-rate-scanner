@@ -4,6 +4,8 @@ Tables (one directory per run):
 - rates.parquet: every extracted price row with full file provenance
 - files.parquet: one row per source file, including failures and early stops
 - current_rates.parquet / current_rates.csv: deduplicated current rates
+- held_rates.parquet: rates whose files state a date after their capture that the
+  publisher's catalog does not corroborate (publication_date_conflict); never current
 - excluded_rates.parquet: rows left out of current rates, with the reason
 - run.json: run manifest, freshness verdicts and problems
 """
@@ -126,11 +128,12 @@ def write_current_csv(path: Path, records: list[dict]) -> None:
             writer.writerow(row)
 
 
-def write_run(out_dir: Path, *, rows, files, current, excluded, manifest) -> None:
+def write_run(out_dir: Path, *, rows, files, current, excluded, manifest, held=()) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     write_parquet(out_dir / 'rates.parquet', rows)
     write_parquet(out_dir / 'files.parquet', files)
     write_parquet(out_dir / 'current_rates.parquet', current)
+    write_parquet(out_dir / 'held_rates.parquet', list(held))
     write_parquet(out_dir / 'excluded_rates.parquet', excluded)
     write_current_csv(out_dir / 'current_rates.csv', current)
     (out_dir / 'run.json').write_text(json.dumps(manifest, indent=1, sort_keys=True, default=str) + '\n')

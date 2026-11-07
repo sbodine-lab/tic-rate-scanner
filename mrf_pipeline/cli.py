@@ -30,9 +30,13 @@ from pathlib import Path
 from . import config
 from . import discover as discovery
 from .codes import TRACKED_CODES
-from .rollup import current_rates
+from .rollup import current_rates, held_rates, publication_date_conflict
 
 TIC = 'tic'
+# Why a payer failed, by kind. Public logs print only how many payers have each
+# kind; names and full reasons stay in the encrypted run.json.
+PROBLEM_KINDS = {'discovery': 'index not read', 'missing_expected': 'expected file missing', 'unreadable': 'file not read',
+                 'incomplete': 'file incomplete', 'undated': 'no dated file', 'stale': 'stale'}
 
 
 def load_payers(path: Path | None = None, only: list[str] | None = None) -> list[dict]:
@@ -113,27 +117,42 @@ def freshness(payer: dict, names: list[str], files: list[dict], today: date, dis
                'files_failed': [f['name'] for f in files if f['status'] == 'failed'],
                'files_partial': [f['name'] for f in files if f['status'] == 'partial']}
     if discovery_error:
-        return {**verdict, 'status': 'failed', 'reason': discovery_error}
-    missing = [p for p in payer.get('expected', []) if not any(re.search(p, n) for n in names)]
+        return {**verdict, 'status': 'failed', 'reason': discovery_error, 'problem_kinds': ['discovery']}
+    # Case-insensitive, as include/exclude are: a publisher may change the case of its file names.
+    missing = [p for p in payer.get('expected', []) if not any(re.search(p, n, re.I) for n in names)]
     dates = sorted(f['last_updated_on'] for f in files if f.get('last_updated_on'))
     newest = dates[-1] if dates else None
     oldest_allowed = (today - timedelta(days=payer.get('max_age_days', 45))).isoformat()
     verdict.update({'newest_last_updated_on': newest, 'oldest_last_updated_on': dates[0] if dates else None,
                     'oldest_allowed': oldest_allowed, 'missing_expected': missing})
-    problems = []
+    problems, kinds = [], []
     if missing:
         problems.append('missing expected file(s): ' + ', '.join(missing))
+        kinds.append('missing_expected')
     if verdict['files_failed']:
         problems.append(f"{len(verdict['files_failed'])} file(s) could not be read")
+        kinds.append('unreadable')
     if verdict['files_partial']:
         problems.append(f"{len(verdict['files_partial'])} file(s) incomplete (undefined or unresolved provider references)")
+        kinds.append('incomplete')
     if not newest:
         problems.append('no file reported last_updated_on')
+        kinds.append('undated')
     elif newest < oldest_allowed:
         problems.append(f'newest file {newest} is older than {oldest_allowed}')
+        kinds.append('stale')
     verdict['status'] = 'ok' if not problems else 'failed'
     verdict['reason'] = '; '.join(problems) or None
+    verdict['problem_kinds'] = kinds
     return verdict
+
+
+def failure_summary(verdicts: list[dict]) -> str:
+    """Anonymous count line for public logs: how many payers failed and of which kinds, never which payers."""
+    failed = [v for v in verdicts if v['status'] == 'failed']
+    counts = {kind: sum(kind in v.get('problem_kinds', ()) for v in failed) for kind in PROBLEM_KINDS}
+    kinds = ', '.join(f'{counts[kind]} {label}' for kind, label in PROBLEM_KINDS.items() if counts[kind])
+    return f"{len(verdicts) - len(failed)} payer(s) ok, {len(failed)} failed{f' ({kinds})' if kinds else ''}"
 
 
 def command_discover(args) -> int:
@@ -198,11 +217,23 @@ def _process_jobs(jobs: list[dict], workers: int, scratch: str | None) -> tuple[
     return files, rows
 
 
+def _held_files(files: list[dict]) -> set[str]:
+    """Files whose rates are held back: marked on the file table, excluded from current rates."""
+    held = set()
+    for file in files:
+        file['publication_date_conflict'] = publication_date_conflict(file)
+        if file['publication_date_conflict']:
+            held.add(file['url'])
+    return held
+
+
 def _finish(out: Path, payers: list[dict], discovered: dict, errors: dict, files: list[dict], rows: list[dict],
             today: date, extra: dict, members: dict[str, list[str]] | None = None) -> int:
     from .output import write_run
-    current, excluded = current_rates(rows, today)
-    for record in current if members else []:  # files whose rows equal a cited file's rows also publish the rate
+    held_files = _held_files(files)
+    current, excluded = current_rates(rows, today, held_files)
+    held = held_rates(excluded, today)
+    for record in [*current, *held] if members else []:  # files whose rows equal a cited file's rows also publish the rate
         identical = sorted(u for source in record['source_files'] for u in members.get(source['url'], []) if u != source['url'])
         record['identical_source_files'] = identical
         record['identical_source_file_count'] = len(identical)
@@ -211,11 +242,12 @@ def _finish(out: Path, payers: list[dict], discovered: dict, errors: dict, files
     manifest = {'as_of': today.isoformat(), 'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                 'tracked_codes': sorted(TRACKED_CODES), 'payers': verdicts, **extra,
                 'counts': {'files': len(files), 'rows': len(rows), 'current_rates': len(current), 'excluded_rows': len(excluded),
-                           'subject_current_rates': sum(r['provider_role'] != 'market' for r in current)}}
-    write_run(out, rows=rows, files=files, current=current, excluded=excluded, manifest=manifest)
+                           'subject_current_rates': sum(r['provider_role'] != 'market' for r in current),
+                           'files_publication_date_conflict': len(held_files), 'held_rates': len(held)}}
+    write_run(out, rows=rows, files=files, current=current, excluded=excluded, manifest=manifest, held=held)
     failed = [v for v in verdicts if v['status'] == 'failed']
     if config.quiet_log():
-        print(f"\n{len(verdicts) - len(failed)} payer(s) ok, {len(failed)} failed; details are in the encrypted run")
+        print(f"\n{failure_summary(verdicts)}; details are in the encrypted run")
         return 1 if failed else 0
     print('\nPayer freshness')
     for verdict in verdicts:
@@ -399,11 +431,14 @@ def command_combine(args) -> int:
             files_by_payer[payer] = [f for f in files if f['payer_id'] == payer]
     rows = [r for group in rows_by_payer.values() for r in group]
     files = [f for group in files_by_payer.values() for f in group]
-    current, excluded = current_rates(rows, today)
+    held_files = _held_files(files)
+    current, excluded = current_rates(rows, today, held_files)
+    held = held_rates(excluded, today)
     manifest = {'as_of': today.isoformat(), 'combined_from': args.runs, 'payers': list(verdicts.values()),
                 'counts': {'files': len(files), 'rows': len(rows), 'current_rates': len(current), 'excluded_rows': len(excluded),
-                           'subject_current_rates': sum(r['provider_role'] != 'market' for r in current)}}
-    write_run(Path(args.out), rows=rows, files=files, current=current, excluded=excluded, manifest=manifest)
+                           'subject_current_rates': sum(r['provider_role'] != 'market' for r in current),
+                           'files_publication_date_conflict': len(held_files), 'held_rates': len(held)}}
+    write_run(Path(args.out), rows=rows, files=files, current=current, excluded=excluded, manifest=manifest, held=held)
     failed = [v['payer_id'] for v in verdicts.values() if v['status'] == 'failed']
     print(f"{manifest['counts']['subject_current_rates']} current {config.subject()['name']} rate(s); failed: {', '.join(failed) or 'none'}")
     return 1 if failed else 0

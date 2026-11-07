@@ -7,8 +7,10 @@
 # plan    discovers each payer's newest files once and size-balances shards
 # shard   streams one shard's files (4 workers on the 4-core runner)
 # combine merges shards, decides each payer's freshness verdict, and attaches
-#         the encrypted result to a release; the run fails if any payer is
-#         missing an expected file, is stale, or had a file not read completely
+#         the encrypted result to a release (runs on main only; a run from
+#         another branch keeps it as a 3-day artifact); the run fails if any
+#         payer is missing an expected file, is stale, or had a file not read
+#         completely
 name: Scan
 
 on:
@@ -86,7 +88,7 @@ jobs:
           python -m mrf_pipeline plan --out "$RUNNER_TEMP/plan.json" --shards 16 --github-matrix \
             ${PAYERS:+--payers "$PAYERS"} ${AS_OF:+--as-of "$AS_OF"}
           age -R scanner.pub -o plan.json.age "$RUNNER_TEMP/plan.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.retry.outputs.skip != 'true'
         with:
           name: plan
@@ -115,7 +117,7 @@ jobs:
         env:
           SCANNER_AGE_KEY: ${{ secrets.SCANNER_AGE_KEY }}
         run: bash scripts/decrypt-config.sh
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: plan
       - name: Stream shard ${{ matrix.shard }}
@@ -129,7 +131,7 @@ jobs:
           if [ -d "$RUNNER_TEMP/shard" ]; then
             tar -C "$RUNNER_TEMP" -czf - shard | age -R scanner.pub -o shard-${{ matrix.shard }}.tar.gz.age
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: shard-${{ matrix.shard }}
@@ -160,7 +162,7 @@ jobs:
         env:
           SCANNER_AGE_KEY: ${{ secrets.SCANNER_AGE_KEY }}
         run: bash scripts/decrypt-config.sh
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           run-id: ${{ inputs.combine_run_id || github.run_id }}
@@ -181,20 +183,35 @@ jobs:
           python -m mrf_pipeline check-references "$work/final"
           echo "references=$?" >> "$GITHUB_OUTPUT"
           exit 0
+      - name: Encrypt the result
+        id: encrypt
+        if: always() && steps.combine.outcome == 'success'
+        run: |
+          stamp=$(date -u +%Y-%m-%d)
+          tar -C "$RUNNER_TEMP/work" -czf - final | age -R scanner.pub -o "scan-${stamp}.tar.gz.age"
+          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
       - name: Attach the encrypted result to a release
         id: release
-        if: always() && steps.combine.outcome == 'success'
+        # Only main publishes. The importer accepts only releases attached by scan.yml on main,
+        # so a run from another branch must neither become the newest release nor move main.
+        if: always() && steps.encrypt.outcome == 'success' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
           STATUS: ${{ steps.combine.outputs.status }}
+          STAMP: ${{ steps.encrypt.outputs.stamp }}
         run: |
-          stamp=$(date -u +%Y-%m-%d)
-          tag="scan-${stamp}-${{ github.run_id }}"
-          tar -C "$RUNNER_TEMP/work" -czf - final | age -R scanner.pub -o "scan-${stamp}.tar.gz.age"
+          tag="scan-${STAMP}-${{ github.run_id }}"
           verdict=$([ "$STATUS" = 0 ] && echo complete || echo "incomplete (at least one payer failed its checks)")
-          gh release create "$tag" "scan-${stamp}.tar.gz.age" --title "Scan ${stamp}" \
+          gh release create "$tag" "scan-${STAMP}.tar.gz.age" --title "Scan ${STAMP}" \
             --notes "Encrypted scan output from run ${{ github.run_id }} (shards from run ${{ inputs.combine_run_id || github.run_id }}): ${verdict}."
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Keep a branch run's encrypted result as an artifact
+        uses: actions/upload-artifact@v7
+        if: always() && steps.encrypt.outcome == 'success' && github.ref != 'refs/heads/main'
+        with:
+          name: scan-result
+          path: scan-${{ steps.encrypt.outputs.stamp }}.tar.gz.age
+          retention-days: 3
       - name: Record the scan date
         if: always() && steps.release.outcome == 'success'
         env:
@@ -202,6 +219,9 @@ jobs:
         run: |
           # A small commit each month also keeps the schedule active (GitHub pauses
           # scheduled workflows in public repositories after 60 days without activity).
+          # It goes on top of the current main, which may have moved during the multi-hour scan.
+          git fetch -q --depth=1 origin main
+          git checkout -q --detach FETCH_HEAD
           printf '{"scanned_at": "%s", "run_id": "%s", "release": "%s", "complete": %s}\n' \
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${{ github.run_id }}" "${{ steps.release.outputs.tag }}" \
             "$([ "$STATUS" = 0 ] && echo true || echo false)" > last-scan.json
