@@ -45,6 +45,9 @@ class FileTarget:
     plans: list[dict] = field(default_factory=list)
     signed: bool = False
     plan_keys: set = field(default_factory=set, repr=False)
+    # 'index' when a table of contents or catalog maps plans to this file (an empty list is then
+    # the index's own statement); 'none' when the discovery method carries no plan mapping.
+    plans_source: str = 'none'
 
     def add_plan(self, plan: dict, limit: int = MAX_PLANS) -> None:
         """Count every distinct plan; keep the first `limit` (plan_count_total says how many were listed)."""
@@ -123,7 +126,7 @@ def toc_targets(payer_id: str, toc_url: str, stream, include, exclude, *, url_fi
             name = file_name(location)
             target = files.get(location) or FileTarget(payer_id, location, name, series_key(payer_id, name),
                                                        (DATE_IN_NAME.search(name) or [None])[0] if DATE_IN_NAME.search(name) else None,
-                                                       toc_url, description=entry.get('description'))
+                                                       toc_url, description=entry.get('description'), plans_source='index')
             for plan in plans:
                 target.add_plan(plan, max_plans)
             files[location] = target
@@ -160,7 +163,7 @@ def _healthsparq(payer: dict, today: date) -> list[FileTarget]:
             continue
         # The metadata repeats a file once per reporting plan; merge them.
         target = targets.setdefault(entry['filePath'], FileTarget(payer['id'], base + entry['filePath'], name,
-                                    series_key(payer['id'], name), entry.get('lastUpdatedOn'), index))
+                                    series_key(payer['id'], name), entry.get('lastUpdatedOn'), index, plans_source='index'))
         for plan in (_plan(p) for p in entry.get('reportingPlans') or []):
             target.add_plan(plan)
     return list(targets.values())

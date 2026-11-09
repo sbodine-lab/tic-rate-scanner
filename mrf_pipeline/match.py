@@ -15,12 +15,41 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 
 from . import config
 
 
 def digits(value) -> str:
     return re.sub(r'\D', '', str(value if value is not None else ''))
+
+
+def identifier(value, *, width: int | None = None) -> str:
+    """Digits of an NPI or EIN as the file states it; '' when the value cannot be one.
+
+    The CMS schema types NPIs as JSON numbers, which ijson yields as int or
+    Decimal. Some publishers serialize them as 1234567893.0 or 1.234567893E9;
+    the identifier is the number's value, never the digits of its text
+    (digits('1.234567893E+9') is a different NPI). A non-integral number is no
+    identifier. ``width`` restores leading zeros of an EIN written as a number.
+    """
+    if value is None or isinstance(value, bool):
+        return ''
+    if isinstance(value, float):
+        value = Decimal(repr(value))
+    if isinstance(value, str) and re.fullmatch(r'\s*\d+\.0*\s*', value):
+        value = Decimal(value.strip())
+    if isinstance(value, Decimal):
+        try:
+            if not value.is_finite() or value != value.to_integral_value() or value < 0:
+                return ''
+            value = int(value)
+        except InvalidOperation:
+            return ''
+    if isinstance(value, int):
+        text = str(value) if value >= 0 else ''
+        return text.zfill(width) if text and width else text
+    return digits(value)
 
 
 @dataclass(frozen=True)
@@ -67,9 +96,9 @@ class Matcher:
             return None
         tin = group.get('tin') if isinstance(group.get('tin'), dict) else {}
         tin_type = str(tin.get('type') or '').strip().lower()
-        tin_value = digits(tin.get('value'))
+        tin_value = identifier(tin.get('value'), width=9 if tin_type == 'ein' else None)
         raw_npis = group.get('npi') if isinstance(group.get('npi'), list) else []
-        npis = [digits(n) for n in raw_npis]
+        npis = [identifier(n) for n in raw_npis]
         if tin_value and tin_value in self.excluded_tins:
             return None
         if tin_type == 'ein' and tin_value in self.subject_tins:

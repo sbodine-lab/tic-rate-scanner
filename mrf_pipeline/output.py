@@ -107,11 +107,11 @@ def read_rows(path: Path) -> list[dict]:
 
 
 CSV_COLUMNS = [
-    'payer_name', 'rate_owner', 'billing_code', 'wildcard_scope', 'billing_code_modifier', 'value_kind', 'negotiated_type',
-    'negotiated_rate', 'unit_label', 'hourly_equivalent', 'hourly_label', 'billing_class', 'setting', 'service_code',
-    'expiration_date', 'networks', 'plan_count', 'plan_names', 'latest_file_last_updated_on', 'source_file_urls',
-    'distinct_amounts_in_context', 'ambiguity_note', 'additional_information', 'entity_name', 'tin_value', 'payer_id',
-    'identical_source_file_count',
+    'payer_name', 'rate_owner', 'billing_code', 'wildcard_scope', 'bundled_tracked_codes', 'billing_code_modifier', 'value_kind',
+    'negotiated_type', 'negotiation_arrangement', 'negotiated_rate', 'unit_label', 'hourly_equivalent', 'hourly_label',
+    'billing_class', 'setting', 'service_code', 'expiration_date', 'networks', 'plan_count', 'plan_list_truncated', 'plan_names',
+    'latest_file_last_updated_on', 'source_file_urls', 'distinct_amounts_in_context', 'ambiguity_note', 'additional_information',
+    'entity_name', 'tin_value', 'payer_id', 'identical_source_file_count',
 ]
 
 
@@ -121,7 +121,7 @@ def write_current_csv(path: Path, records: list[dict]) -> None:
         writer.writeheader()
         for record in records:
             row = {k: record.get(k) for k in CSV_COLUMNS}
-            for key in ('billing_code_modifier', 'service_code', 'networks'):
+            for key in ('billing_code_modifier', 'service_code', 'networks', 'bundled_tracked_codes'):
                 row[key] = '|'.join(record.get(key) or [])
             row['plan_names'] = '|'.join(sorted({p.get('plan_name', '') for p in record.get('plans') or []}))[:2000]
             row['source_file_urls'] = '|'.join(s['url'] for s in record.get('source_files') or [])

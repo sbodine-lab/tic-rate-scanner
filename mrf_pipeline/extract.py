@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Iterable
@@ -19,13 +20,19 @@ import ijson
 from ijson.common import ObjectBuilder
 
 from .codes import ABA_CODE_TYPES, TRACKED_CODES, wildcard_scope
-from .match import GroupMatch, Matcher
+from .match import GroupMatch, Matcher, identifier
 
+# Root fields of a single-plan file (CMS: required when no table of contents is published).
+PLAN_FIELDS = ('plan_name', 'plan_id_type', 'plan_id', 'plan_market_type', 'issuer_name', 'plan_sponsor_name')
+# `schema_version` is the draft CMS 3.0 name for `version`; recorded so such a file is recognized.
 HEADER_FIELDS = frozenset({
-    'reporting_entity_name', 'reporting_entity_type', 'last_updated_on', 'version',
-    'plan_name', 'plan_id_type', 'plan_id', 'plan_market_type', 'issuer_name', 'plan_sponsor_name',
+    'reporting_entity_name', 'reporting_entity_type', 'last_updated_on', 'version', 'schema_version', *PLAN_FIELDS,
 })
 KNOWN_NEGOTIATED_TYPES = frozenset({'negotiated', 'derived', 'fee schedule', 'percentage', 'per diem'})
+# CMS: bundled_codes list a bundle's codes, covered_services a capitation's.
+CONTAINED_CODE_ARRANGEMENTS = frozenset({'bundle', 'capitation'})
+# The in-network layouts this extractor reads: CMS 1.x (inline groups, remote references) and 2.x.
+SUPPORTED_SCHEMA_MAJORS = frozenset({1, 2})
 _START = frozenset({'start_map', 'start_array'})
 _END = frozenset({'end_map', 'end_array'})
 
@@ -97,6 +104,27 @@ def parse_rate(value) -> tuple[str | None, str | None]:
     return format(value, 'f'), problem
 
 
+def schema_major(header: dict) -> int | None:
+    """Major schema version the file declares; None when it declares none (allowed in CMS 1.x)."""
+    match = re.match(r'\s*[vV]?(\d+)', header.get('schema_version') or header.get('version') or '')
+    return int(match.group(1)) if match else None
+
+
+def file_plan(header: dict) -> dict | None:
+    """The plan a single-plan file names in its own root fields, as text (None when it names none)."""
+    plan = {key: header[key] for key in PLAN_FIELDS if header.get(key)}
+    return plan or None
+
+
+def _identifier_text(value) -> str | None:
+    """Source text of a TIN value; a JSON number is written as its integer digits, never '84.0'."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip()
+    return identifier(value) or str(value)
+
+
 def _string_list(value, *, upper: bool = False) -> list[str]:
     if value is None:
         return []
@@ -121,6 +149,7 @@ class _Extractor:
         self.unresolved_remote: set[str] = set()
         self.referenced: set[str] = set()
         self.deferred: list[tuple[dict, int, dict]] = []
+        self.unread_contained_items = 0
         self.refs_complete = False
         self.saw_in_network = False
         self.order = None
@@ -191,7 +220,7 @@ class _Extractor:
                     found.add(str(child['billing_code']).strip().upper())
         return sorted(found)
 
-    def finish_item(self, item: dict, blocks: list[dict], ordinal: int) -> None:
+    def finish_item(self, item: dict, blocks: list[dict], ordinal: int, *, prices_skipped: bool = False) -> None:
         self.stats['in_network_items'] += 1
         relevance = self.relevance(item)
         if relevance is None:
@@ -200,6 +229,15 @@ class _Extractor:
         bundled = self.bundled_tracked(item)
         if relevance is False:
             if not bundled:
+                return
+            if prices_skipped:
+                # The prices streamed past before the item showed it bundles or capitates a
+                # tracked code (its arrangement came after them). Unread, so the file is incomplete.
+                if normalize_type(item.get('negotiation_arrangement')) in CONTAINED_CODE_ARRANGEMENTS | {None}:
+                    self.unread_contained_items += 1
+                    self.problem('contained_code_prices_not_read', ordinal)
+                else:  # fee-for-service: contained codes have no CMS meaning there
+                    self.problem('contained_codes_outside_bundle_or_capitation', ordinal)
                 return
             relevance = 'bundle_contains'
         if relevance == 'wildcard':
@@ -265,7 +303,7 @@ class _Extractor:
                     'provider_group_id': rid,
                     'network_names': networks,
                     'tin_type': normalize_type(tin.get('type')),
-                    'tin_value': str(tin.get('value')).strip() if tin.get('value') is not None else None,
+                    'tin_value': _identifier_text(tin.get('value')),
                     'tin_business_name': tin.get('business_name'),
                     'npi_count': len(npis),
                     'matched_npis': list(match.matched_npis),
@@ -298,7 +336,14 @@ class _Extractor:
         if undefined:
             self.problem('undefined_provider_references', sorted(undefined)[:5][0], count=len(undefined))
         unresolved_used = self.referenced & self.unresolved_remote
-        complete = self.saw_in_network and not undefined and not unresolved_used
+        major = schema_major(self.header)
+        unsupported = 'schema_version' in self.header or (major is not None and major not in SUPPORTED_SCHEMA_MAJORS)
+        if unsupported:
+            # A later CMS layout renames fields this reader keys on (draft 3.0: tin.ein, billing_code_modifiers);
+            # reading it as 2.x could report "no subject rates" from a file it did not understand.
+            self.problem('unsupported_schema_version', self.header.get('schema_version') or self.header.get('version'))
+        complete = (self.saw_in_network and not undefined and not unresolved_used
+                    and not self.unread_contained_items and not unsupported)
         if not self.saw_in_network:
             self.problem('missing_in_network_array')
         self.stats.update({'subject_rows': sum(r['provider_role'] != 'market' for r in self.rows),
@@ -319,7 +364,7 @@ def extract(stream, matcher: Matcher, *, codes: Iterable[str] = TRACKED_CODES,
     """
     state = _Extractor(matcher, codes, resolve_remote)
     builder, target, depth, skip = None, None, 0, 0
-    item, blocks, item_ordinal = None, None, 0
+    item, blocks, item_ordinal, prices_skipped = None, None, 0, False
     try:
         for prefix, event, value in ijson.parse(stream, buf_size=buf_size):
             if skip:
@@ -351,8 +396,12 @@ def extract(stream, matcher: Matcher, *, codes: Iterable[str] = TRACKED_CODES,
             if prefix == 'in_network.item.negotiated_rates':
                 if event == 'start_array':
                     relevance = state.relevance(item)
-                    if relevance is False and normalize_type(item.get('negotiation_arrangement')) != 'bundle':
-                        skip = 1  # token-level skip of a non-ABA item's prices
+                    if (relevance is False
+                            and normalize_type(item.get('negotiation_arrangement')) not in CONTAINED_CODE_ARRANGEMENTS):
+                        # Token-level skip of a non-ABA item's prices. A bundle or capitation may
+                        # contain a tracked code, so its prices are kept; when the arrangement comes
+                        # after the prices, finish_item says the skipped prices were needed.
+                        skip, prices_skipped = 1, True
                     elif relevance is None:
                         # The code follows its prices in this item; buffer until it is known.
                         state.stats['items_buffered_before_code'] = state.stats.get('items_buffered_before_code', 0) + 1
@@ -368,9 +417,9 @@ def extract(stream, matcher: Matcher, *, codes: Iterable[str] = TRACKED_CODES,
                 continue
             if prefix == 'in_network.item':
                 if event == 'start_map':
-                    item, blocks, item_ordinal = {}, [], item_ordinal + 1
+                    item, blocks, item_ordinal, prices_skipped = {}, [], item_ordinal + 1, False
                 elif event == 'end_map':
-                    state.finish_item(item, blocks, item_ordinal)
+                    state.finish_item(item, blocks, item_ordinal, prices_skipped=prices_skipped)
                     item, blocks = None, None
                 continue
             if prefix == 'provider_references.item':

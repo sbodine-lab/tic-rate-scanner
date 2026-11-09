@@ -77,7 +77,13 @@ def process_file(target: dict, scope: str, scratch: str | None, attempts: int = 
             time.sleep(10 * attempt)
     status = ('no_match_references_scanned' if result.stats.get('early_stop') else
               'complete' if result.complete else 'partial')
-    file_record = {**_file_base(target), 'status': status, 'error': None, 'attempts': attempt,
+    from .extract import file_plan
+    plans, plans_source = target['plans'], target.get('plans_source')
+    if not plans and (header_plan := file_plan(result.header)):
+        # CMS: a single-plan file published without a table of contents names its plan in its root.
+        plans, plans_source = [header_plan], 'file_header'
+        target = {**target, 'plans': plans, 'plan_count_total': 1}
+    file_record = {**_file_base(target), 'plans_source': plans_source, 'status': status, 'error': None, 'attempts': attempt,
                    'seconds': round(time.time() - started, 1), 'last_updated_on': result.header.get('last_updated_on'),
                    'reporting_entity_name': result.header.get('reporting_entity_name'),
                    'reporting_entity_type': result.header.get('reporting_entity_type'),
@@ -92,7 +98,7 @@ def process_file(target: dict, scope: str, scratch: str | None, attempts: int = 
              'file_sha256': meta.sha256, 'retrieved_at': meta.retrieved_at,
              'reporting_entity_name': result.header.get('reporting_entity_name'),
              'schema_version': result.header.get('version'), 'file_status': status,
-             'plans': target['plans']} for row in result.rows]
+             'plans': plans} for row in result.rows]
     return {'file': file_record, 'rows': rows}
 
 
@@ -195,7 +201,7 @@ def _discover_jobs(payers: list[dict], today: date, *, allow_cloud_only: bool, d
             jobs.append({'payer_id': payer['id'], 'payer_name': payer['name'], 'url': target.url, 'name': target.name,
                          'series': target.series, 'published': target.published, 'size': target.size,
                          'index_url': target.index_url, 'provenance_url': target.provenance_url(), 'plans': target.plans,
-                         'plan_count_total': target.plan_count_total,
+                         'plan_count_total': target.plan_count_total, 'plans_source': target.plans_source,
                          'scope': payer.get('scope', default_scope)})
     return jobs, discovered, errors
 
@@ -227,6 +233,20 @@ def _held_files(files: list[dict]) -> set[str]:
     return held
 
 
+def _label_plan_lists(files: list[dict], records: list[dict]) -> None:
+    """A rate's plan_count counts the plans kept; say when a cited file listed more than the cap.
+
+    Discovery keeps at most discover.MAX_PLANS plans per file (files.parquet records
+    plan_count_total), so a capped file makes plan_count a lower bound, not the count.
+    None means a cited file's run predates the flag.
+    """
+    capped = {f['url']: f.get('plans_truncated') for f in files}
+    for record in records:
+        cited = [s['url'] for s in record['source_files']] + list(record.get('identical_source_files') or [])
+        flags = [capped.get(url) for url in cited]
+        record['plan_list_truncated'] = True if any(flags) else None if any(f is None for f in flags) else False
+
+
 def _finish(out: Path, payers: list[dict], discovered: dict, errors: dict, files: list[dict], rows: list[dict],
             today: date, extra: dict, members: dict[str, list[str]] | None = None) -> int:
     from .output import write_run
@@ -237,6 +257,7 @@ def _finish(out: Path, payers: list[dict], discovered: dict, errors: dict, files
         identical = sorted(u for source in record['source_files'] for u in members.get(source['url'], []) if u != source['url'])
         record['identical_source_files'] = identical
         record['identical_source_file_count'] = len(identical)
+    _label_plan_lists(files, [*current, *held])
     verdicts = [freshness(p, discovered.get(p['id'], []), [f for f in files if f['payer_id'] == p['id']], today, errors.get(p['id']))
                 for p in payers]
     manifest = {'as_of': today.isoformat(), 'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -434,6 +455,7 @@ def command_combine(args) -> int:
     held_files = _held_files(files)
     current, excluded = current_rates(rows, today, held_files)
     held = held_rates(excluded, today)
+    _label_plan_lists(files, [*current, *held])
     manifest = {'as_of': today.isoformat(), 'combined_from': args.runs, 'payers': list(verdicts.values()),
                 'counts': {'files': len(files), 'rows': len(rows), 'current_rates': len(current), 'excluded_rows': len(excluded),
                            'subject_current_rates': sum(r['provider_role'] != 'market' for r in current),
