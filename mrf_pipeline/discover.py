@@ -45,6 +45,9 @@ class FileTarget:
     plans: list[dict] = field(default_factory=list)
     signed: bool = False
     plan_keys: set = field(default_factory=set, repr=False)
+    # 'index' when a table of contents or catalog maps plans to this file (an empty list is then
+    # the index's own statement); 'none' when the discovery method carries no plan mapping.
+    plans_source: str = 'none'
 
     def add_plan(self, plan: dict, limit: int = MAX_PLANS) -> None:
         """Count every distinct plan; keep the first `limit` (plan_count_total says how many were listed)."""
@@ -123,7 +126,7 @@ def toc_targets(payer_id: str, toc_url: str, stream, include, exclude, *, url_fi
             name = file_name(location)
             target = files.get(location) or FileTarget(payer_id, location, name, series_key(payer_id, name),
                                                        (DATE_IN_NAME.search(name) or [None])[0] if DATE_IN_NAME.search(name) else None,
-                                                       toc_url, description=entry.get('description'))
+                                                       toc_url, description=entry.get('description'), plans_source='index')
             for plan in plans:
                 target.add_plan(plan, max_plans)
             files[location] = target
@@ -160,7 +163,7 @@ def _healthsparq(payer: dict, today: date) -> list[FileTarget]:
             continue
         # The metadata repeats a file once per reporting plan; merge them.
         target = targets.setdefault(entry['filePath'], FileTarget(payer['id'], base + entry['filePath'], name,
-                                    series_key(payer['id'], name), entry.get('lastUpdatedOn'), index))
+                                    series_key(payer['id'], name), entry.get('lastUpdatedOn'), index, plans_source='index'))
         for plan in (_plan(p) for p in entry.get('reportingPlans') or []):
             target.add_plan(plan)
     return list(targets.values())
@@ -256,17 +259,44 @@ def _direct(payer: dict, today: date) -> list[FileTarget]:
     return targets
 
 
+def linked_location(links: list[str]):
+    """Map a table-of-contents location to the page's link for the same file on the same host.
+
+    Some publishers' tables of contents give a path that answers 404 (an extra
+    directory, different case) while their page links the same file name on the
+    same host. The page's link is what can be read, so it is the file's URL; a
+    location the page does not link exactly once is kept as listed (and fails
+    loudly if it cannot be read).
+    """
+    by_name: dict[tuple[str, str], list[str]] = {}
+    for link in links:
+        by_name.setdefault((urllib.parse.urlsplit(link).netloc.lower(), file_name(link).lower()), []).append(link)
+    listed = set(links)
+
+    def resolve(location: str) -> str:
+        if location in listed:
+            return location
+        same = by_name.get((urllib.parse.urlsplit(location).netloc.lower(), file_name(location).lower()), [])
+        return same[0] if len(same) == 1 else location
+    return resolve
+
+
 def _listing(payer: dict, today: date) -> list[FileTarget]:
-    """An HTML page of links: use the newest linked table of contents, else the newest file per series."""
+    """An HTML page of links: use the newest linked table of contents, else the newest file per series.
+
+    `index_pattern` matches case-insensitively, as `include`/`exclude` do: a
+    publisher may change the case of its index name between editions.
+    """
     page = _get_bytes(payer['page_url'], 20_000_000).decode('utf-8', 'replace')
     links = sorted(set(re.findall(r'href=["\']([^"\']+)["\']', page)))
     links = [urllib.parse.urljoin(payer['page_url'], link) for link in links]
     if payer.get('index_pattern'):
-        indexes = sorted((l for l in links if re.search(payer['index_pattern'], l)), key=lambda l: (DATE_IN_NAME.search(l) or [''])[0])
+        indexes = sorted((l for l in links if re.search(payer['index_pattern'], l, re.I)), key=lambda l: (DATE_IN_NAME.search(l) or [''])[0])
         if not indexes:
             raise DiscoveryError(f"{payer['id']}: no table of contents linked from {payer['page_url']}")
         data = _get_bytes(indexes[-1])
-        return toc_targets(payer['id'], indexes[-1], io.BytesIO(data), payer.get('include'), payer.get('exclude'))
+        return toc_targets(payer['id'], indexes[-1], io.BytesIO(data), payer.get('include'), payer.get('exclude'),
+                           url_fix=linked_location(links))
     newest: dict[str, str] = {}
     for link in links:
         if _matches(link, payer.get('include'), payer.get('exclude')):

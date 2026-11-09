@@ -12,11 +12,14 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 
 from . import config
 from .codes import FIFTEEN_MINUTE_CODES, PER_SERVICE_LABEL, UNIT_BASIS, UNIT_LABEL, hourly_equivalent
 
 OPEN_ENDED = '9999-12-31'
+# A file dated after its capture may be an early-posted edition only this far ahead (app/core/rates.py).
+EARLY_POSTING_MAX_DAYS = 31
 VALUE_KINDS = {
     'negotiated': 'dollars_per_unit',
     'fee schedule': 'dollars_per_unit',
@@ -27,9 +30,36 @@ VALUE_KINDS = {
 
 
 def value_kind(row: dict) -> str:
+    # A percentage of billed charges is never dollars, whatever the arrangement (CMS: the
+    # negotiated_rate of a "percentage" price is a whole-number percent).
+    if row.get('negotiated_type') == 'percentage':
+        return VALUE_KINDS['percentage']
     if row.get('negotiation_arrangement') in {'bundle', 'capitation'}:
         return f"{row['negotiation_arrangement']}_amount"
     return VALUE_KINDS.get(row.get('negotiated_type') or '', 'unknown_type')
+
+
+def exclusion_reason(row: dict, as_of: date, held_files=frozenset()) -> str | None:
+    """Why an extracted price of the newest edition is not a current rate (None: it is).
+
+    mrf_import._eligible_rows applies the same rule to the run's rows.
+    """
+    status = expiration_status(row, as_of)
+    if status == 'expired':
+        return 'expired'
+    if status == 'unparsed':
+        return 'expiration_unparsed'
+    if row.get('identity_conflict'):
+        return 'identity_conflict'
+    if row.get('negotiated_rate') is None:
+        return 'invalid_rate'
+    if row.get('rate_problem') == 'non_positive_rate':
+        return 'non_positive_rate'  # CMS: negotiated_rate has an exclusive minimum of 0
+    if row.get('negotiated_type') not in VALUE_KINDS:
+        return 'unknown_negotiated_type'  # outside the CMS enum: dollars or percent is unknown
+    if row['source_file_url'] in held_files:
+        return 'publication_date_conflict'
+    return None
 
 
 def expiration_status(row: dict, as_of: date) -> str:
@@ -56,29 +86,81 @@ def rate_key(row: dict) -> tuple:
     )
 
 
+def _http_day(value: str | None) -> str | None:
+    try:
+        return parsedate_to_datetime(value).date().isoformat() if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def publication_date_conflict(file: dict) -> bool:
+    """A file dated after its own capture is conflicting evidence, not current.
+
+    It is an early-posted edition instead only when the publisher's catalog
+    states the same edition date, the transport copy predates capture and the
+    date is at most EARLY_POSTING_MAX_DAYS ahead. The reader applies the same
+    rule (app/core/rates.py _early_posted_on), so both call such a file's rates
+    publication_date_conflict, never current.
+    """
+    stamp, captured = (file.get('last_updated_on') or '')[:10], (file.get('retrieved_at') or '')[:10]
+    if not stamp or not captured or stamp <= captured:
+        return False
+    posted = _http_day(file.get('http_last_modified'))
+    try:
+        ahead = (date.fromisoformat(stamp) - date.fromisoformat(captured)).days
+    except ValueError:
+        return True
+    return not (file.get('published') == stamp and posted and posted <= captured and ahead <= EARLY_POSTING_MAX_DAYS)
+
+
+def _edition_stamp(row: dict) -> tuple:
+    return (row.get('file_last_updated_on') or '', row.get('retrieved_at') or '')
+
+
 def latest_editions(rows: list[dict]) -> list[dict]:
     """Keep only rows from the newest edition of each file series."""
     newest: dict[str, tuple] = {}
     for row in rows:
-        stamp = (row.get('file_last_updated_on') or '', row.get('retrieved_at') or '')
+        stamp = _edition_stamp(row)
         series = row['file_series']
         if series not in newest or stamp > newest[series]:
             newest[series] = stamp
-    return [r for r in rows if (r.get('file_last_updated_on') or '', r.get('retrieved_at') or '') == newest[r['file_series']]]
+    return [r for r in rows if _edition_stamp(r) == newest[r['file_series']]]
 
 
-def current_rates(rows: list[dict], as_of: date) -> tuple[list[dict], list[dict]]:
-    """Return (current rate records, excluded rows with reasons)."""
+def current_rates(rows: list[dict], as_of: date, held_files: frozenset | set = frozenset()) -> tuple[list[dict], list[dict]]:
+    """Return (current rate records, excluded rows with reasons).
+
+    Rows of `held_files` (see publication_date_conflict) are excluded as
+    publication_date_conflict; held_rates() keeps them as labeled records.
+    Rows of an older edition of a file series are listed as superseded_edition,
+    so no extracted price leaves the run without a stated reason.
+    """
     excluded, grouped = [], defaultdict(list)
-    for row in latest_editions(rows):
-        status = expiration_status(row, as_of)
-        reason = ('expired' if status == 'expired' else 'expiration_unparsed' if status == 'unparsed'
-                  else 'identity_conflict' if row.get('identity_conflict')
-                  else 'invalid_rate' if row.get('negotiated_rate') is None else None)
+    latest = latest_editions(rows)
+    if len(latest) != len(rows):
+        kept = {id(row) for row in latest}
+        excluded.extend({**row, 'exclusion_reason': 'superseded_edition'} for row in rows if id(row) not in kept)
+    for row in latest:
+        reason = exclusion_reason(row, as_of, held_files)
         if reason:
             excluded.append({**row, 'exclusion_reason': reason})
             continue
         grouped[rate_key(row)].append(row)
+    return _records(grouped, as_of), excluded
+
+
+def held_rates(excluded: list[dict], as_of: date) -> list[dict]:
+    """Records for rates whose files carry a publication date conflict: dated evidence, never current."""
+    grouped = defaultdict(list)
+    for row in excluded:
+        if row['exclusion_reason'] == 'publication_date_conflict':
+            clean = {key: value for key, value in row.items() if key != 'exclusion_reason'}
+            grouped[rate_key(clean)].append(clean)
+    return _records(grouped, as_of)
+
+
+def _records(grouped: dict, as_of: date) -> list[dict]:
     records = []
     subject = config.subject()['name']
     merged_plans = {}  # records built from the same plan lists share one merged list
@@ -109,6 +191,9 @@ def current_rates(rows: list[dict], as_of: date) -> tuple[list[dict], list[dict]
                           else f"Market rate: {first['entity_name']} (not {subject})",
             'entity_id': first['entity_id'], 'entity_name': first['entity_name'], 'tin_value': first.get('tin_value') if own else None,
             'billing_code': first['billing_code'], 'wildcard_scope': first.get('wildcard_scope'),
+            # Tracked codes a bundle (bundled_codes) or capitation (covered_services) contains; the
+            # amount is the whole arrangement's, never a price of one contained code.
+            'bundled_tracked_codes': sorted({c for r in group for c in r.get('bundled_tracked_codes') or []}),
             'billing_code_modifier': list(first.get('billing_code_modifier') or []),
             'negotiated_type': first.get('negotiated_type'), 'negotiation_arrangement': first.get('negotiation_arrangement'),
             'value_kind': kind, 'negotiated_rate': first['negotiated_rate'],
@@ -130,7 +215,7 @@ def current_rates(rows: list[dict], as_of: date) -> tuple[list[dict], list[dict]
         })
     _flag_unresolved_ladders(records)
     records.sort(key=lambda r: (r['payer_id'], r['provider_role'], r['entity_id'], r['billing_code'], r['billing_code_modifier'], r['value_kind'], Decimal(r['negotiated_rate'])))
-    return records, excluded
+    return records
 
 
 def _flag_unresolved_ladders(records: list[dict]) -> None:

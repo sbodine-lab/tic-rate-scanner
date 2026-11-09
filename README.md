@@ -13,7 +13,9 @@ and statuses, never names, identifiers or amounts.
   17th) and on demand: plan, 16 parallel shards, combine. A run fails when any
   payer is missing an expected file, is older than its allowed age, or has a
   file that could not be read completely.
-- Each run's encrypted output is attached to a `scan-YYYY-MM-DD-<run>` release.
+- Each run on `main` attaches its encrypted output to a `scan-YYYY-MM-DD-<run>`
+  release. A run started from another branch (to try a change on a few payers)
+  keeps it as a 3-day `scan-result` artifact instead and never pushes to `main`.
 - `last-scan.json` records the latest run.
 
 Tests use synthetic data only: `python -m unittest discover -s tests`.
